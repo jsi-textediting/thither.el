@@ -73,6 +73,34 @@
   (let ((p (thither--parse file)))
     (cons (car p) (thither--normalize (car p) (cdr p)))))
 
+;;;; Errors
+
+(defun thither--file-error (err file what)
+  "Re-signal the `thither-error' ERR as the matching Emacs file error."
+  (let* ((code (cadr err)) (msg (or (caddr err) code)))
+    (cond ((member code '("ENOENT" "ENOTDIR"))
+           (signal 'file-missing (list what "No such file or directory" file)))
+          ((equal code "EEXIST")
+           (signal 'file-already-exists (list what "File exists" file)))
+          ((member code '("EACCES" "EPERM"))
+           (signal 'permission-denied (list what "Permission denied" file)))
+          ((equal code "EISDIR") (signal 'file-error (list what "Is a directory" file)))
+          ((equal code "conflict") (signal 'file-error (list what "File changed on the host" file)))
+          ((equal code "unknown_op")
+           (signal 'file-error
+                   (list what (format "thither-server on the host is too old (%s); upgrade it" msg)
+                         file)))
+          (t (signal 'file-error (list what msg file))))))
+
+(defmacro thither--io (file what &rest body)
+  "Run BODY, turning `thither-error' into the matching file error for FILE."
+  (declare (indent 2))
+  `(condition-case err (progn ,@body)
+     (thither-error (thither--file-error err ,file ,what))))
+
+(defun thither--missing-p (err)
+  (member (cadr err) '("ENOENT" "ENOTDIR" "EACCES" "ELOOP")))
+
 ;;;; Connections and cache
 
 (defvar thither--connections (make-hash-table :test 'equal))
@@ -129,34 +157,6 @@
 (defun thither--text (bytes &optional coding)
   "Decode the unibyte string BYTES (output of the host) as text."
   (decode-coding-string bytes (or coding coding-system-for-read 'utf-8)))
-
-;;;; Errors
-
-(defun thither--file-error (err file what)
-  "Re-signal the `thither-error' ERR as the matching Emacs file error."
-  (let* ((code (cadr err)) (msg (or (caddr err) code)))
-    (cond ((member code '("ENOENT" "ENOTDIR"))
-           (signal 'file-missing (list what "No such file or directory" file)))
-          ((equal code "EEXIST")
-           (signal 'file-already-exists (list what "File exists" file)))
-          ((member code '("EACCES" "EPERM"))
-           (signal 'permission-denied (list what "Permission denied" file)))
-          ((equal code "EISDIR") (signal 'file-error (list what "Is a directory" file)))
-          ((equal code "conflict") (signal 'file-error (list what "File changed on the host" file)))
-          ((equal code "unknown_op")
-           (signal 'file-error
-                   (list what (format "thither-server on the host is too old (%s); upgrade it" msg)
-                         file)))
-          (t (signal 'file-error (list what msg file))))))
-
-(defmacro thither--io (file what &rest body)
-  "Run BODY, turning `thither-error' into the matching file error for FILE."
-  (declare (indent 2))
-  `(condition-case err (progn ,@body)
-     (thither-error (thither--file-error err ,file ,what))))
-
-(defun thither--missing-p (err)
-  (member (cadr err) '("ENOENT" "ENOTDIR" "EACCES" "ELOOP")))
 
 ;;;; Stat
 
@@ -219,11 +219,32 @@
   (let ((fn (gethash operation thither--handlers)))
     (if fn (apply fn args) (thither--real operation args))))
 
+(defvar tramp-ignored-file-name-regexp)
+
+(defun thither--claim-names ()
+  "Make /thither:HOST: names ours, not TRAMP's.
+TRAMP's handler also matches them (\"thither\" looks like a method) and
+`tramp-register-file-name-handlers' puts it in front, so: tell TRAMP to
+ignore the names, and move this handler back to the front."
+  (when (boundp 'tramp-ignored-file-name-regexp)
+    (let ((old tramp-ignored-file-name-regexp))
+      (unless (and old (string-match-p (regexp-quote thither-file-name-regexp) old))
+        (setq tramp-ignored-file-name-regexp
+              (if old (concat "\\(?:" old "\\)\\|\\(?:" thither-file-name-regexp "\\)")
+                thither-file-name-regexp)))))
+  (let ((entry (or (rassq #'thither-file-name-handler file-name-handler-alist)
+                   (cons thither-file-name-regexp #'thither-file-name-handler))))
+    (setq file-name-handler-alist (cons entry (delq entry file-name-handler-alist)))))
+
 ;;;###autoload
 (defun thither-fs-enable ()
   "Register the /thither:HOST:/ file name handler."
-  (unless (rassq #'thither-file-name-handler file-name-handler-alist)
-    (push (cons thither-file-name-regexp #'thither-file-name-handler) file-name-handler-alist)))
+  (thither--claim-names)
+  (add-hook 'before-save-hook #'thither--save-confirmed)
+  (with-eval-after-load 'tramp
+    ;; TRAMP re-registers (and re-fronts) its handlers, e.g. on a `tramp-syntax' change
+    (advice-add 'tramp-register-file-name-handlers :after #'thither--claim-names)
+    (thither--claim-names)))
 
 ;;;; Name operations
 
@@ -425,7 +446,33 @@ The server answers with access(2), so ACLs, read-only mounts and root are right.
 ;;;; Reading and writing
 
 (defvar-local thither--visited-etag nil
-  "Etag of the remote file this buffer was read from or saved to.")
+  "Etag of the remote file this buffer was read from or saved to.
+\"-\" once our `rename-file' moved the file away (a rename backup).")
+(defvar-local thither--etag-file nil
+  "The file name `thither--visited-etag' belongs to.
+After `set-visited-file-name' the etag says nothing about the new name.")
+(defvar-local thither--host-etag nil
+  "Etag the host had (\"-\": no file) when `verify-visited-file-modtime'
+last failed.  `basic-save-buffer' asks before overwriting such a file, so
+when it saves anyway that is the version it was allowed to replace.")
+;; set by `insert-file-contents' before the major mode kills local variables
+(dolist (v '(thither--visited-etag thither--etag-file thither--host-etag))
+  (put v 'permanent-local t))
+
+(defun thither--set-etag (file etag)
+  "Record that the buffer holds version ETAG (nil: unknown) of FILE."
+  (setq thither--visited-etag etag
+        thither--etag-file (and etag file)
+        thither--host-etag nil))
+
+(defun thither--save-confirmed ()
+  "In `before-save-hook': the save goes on despite a changed host file.
+`basic-save-buffer' runs the hook only after the user confirmed overwriting
+it (or when the file is gone), so replace that version instead of failing
+with a conflict."
+  (when thither--host-etag
+    (setq thither--visited-etag thither--host-etag
+          thither--host-etag nil)))
 
 (defun thither--temp-file (file)
   (make-temp-file "thither-" nil (file-name-extension file t)))
@@ -445,8 +492,8 @@ The server answers with access(2), so ACLs, read-only mounts and root are right.
                 (file-missing
                  ;; Like the C function: a visited missing file still names the buffer.
                  (when visit
-                   (setq buffer-file-name (thither--expand-name filename)
-                         thither--visited-etag nil)
+                   (setq buffer-file-name (thither--expand-name filename))
+                   (thither--set-etag buffer-file-name nil)
                    (set-buffer-modified-p nil))
                  (signal (car err) (cdr err)))))
          (tmp (thither--temp-file filename))
@@ -458,8 +505,8 @@ The server answers with access(2), so ACLs, read-only mounts and root are right.
           (setq ret (thither--real 'insert-file-contents (list tmp visit beg end replace))))
       (ignore-errors (delete-file tmp)))
     (when visit
-      (setq buffer-file-name (thither--expand-name filename)
-            thither--visited-etag (cdr res))
+      (setq buffer-file-name (thither--expand-name filename))
+      (thither--set-etag buffer-file-name (cdr res))
       (setq buffer-read-only (not (file-writable-p filename)))
       (set-buffer-modified-p nil))
     (list (thither--expand-name filename) (cadr ret))))
@@ -494,7 +541,8 @@ The server answers with access(2), so ACLs, read-only mounts and root are right.
                  (thither--region-bytes start end)))
          ;; Etag the buffer was read from: a save over a changed file conflicts.
          (expect (cond ((eq mustbenew 'excl) "-")
-                       ((and whole (equal buffer-file-name name)) thither--visited-etag))))
+                       ((and whole (equal buffer-file-name name) (equal thither--etag-file name))
+                        thither--visited-etag))))
     (when (and mustbenew (not (eq mustbenew 'excl)) (thither--stat (car p) (cdr p) nil t)
                (not (y-or-n-p (format "File %s exists; overwrite? " name))))
       (signal 'file-already-exists (list "File exists" name)))
@@ -518,8 +566,8 @@ The server answers with access(2), so ACLs, read-only mounts and root are right.
            (visited (cond ((eq visit t) name)
                           ((stringp visit) (expand-file-name visit)))))
       (when visited
-        (setq buffer-file-name visited
-              thither--visited-etag (and (thither--same-host visited name) (gethash "etag" st)))
+        (setq buffer-file-name visited)
+        (thither--set-etag visited (and (thither--same-host visited name) (gethash "etag" st)))
         (set-buffer-modified-p nil))
       (when (and (or (null visit) (eq visit t) (stringp visit)) (not noninteractive))
         (message "Wrote %s" (or visited name)))
@@ -528,15 +576,19 @@ The server answers with access(2), so ACLs, read-only mounts and root are right.
 (thither--define verify-visited-file-modtime (&optional buf)
   (with-current-buffer (or buf (current-buffer))
     (if (or (null thither--visited-etag) (null buffer-file-name)
-            (not (thither--split buffer-file-name)))
+            (not (thither--split buffer-file-name))
+            (not (equal thither--etag-file buffer-file-name)))
         t
-      (let ((st (thither--st buffer-file-name nil t)))
-        (and st (equal (gethash "etag" st) thither--visited-etag))))))
+      (let* ((st (thither--st buffer-file-name nil t))
+             (now (if st (gethash "etag" st) "-")))
+        ;; see `thither--save-confirmed'
+        (setq thither--host-etag (and (not (equal now thither--visited-etag)) now))
+        (not thither--host-etag)))))
 
 (thither--define set-visited-file-modtime (&optional _time)
   (when (and buffer-file-name (thither--split buffer-file-name))
     (let ((st (thither--st buffer-file-name nil t)))
-      (setq thither--visited-etag (and st (gethash "etag" st))))))
+      (thither--set-etag buffer-file-name (and st (gethash "etag" st))))))
 
 (thither--define visited-file-modtime ()
   (if thither--visited-etag 0 0))
@@ -580,6 +632,20 @@ The server answers with access(2), so ACLs, read-only mounts and root are right.
   (let ((pa (thither--split a)) (pb (thither--split b)))
     (and pa pb (equal (car pa) (car pb)))))
 
+(defun thither--moved-away (file)
+  "FILE was renamed: a buffer that holds it may now create it anew.
+That is what a rename backup does just before the buffer is written."
+  (let ((buf (get-file-buffer file)))
+    (when buf
+      (with-current-buffer buf
+        (when (and thither--visited-etag (equal thither--etag-file buffer-file-name))
+          (setq thither--visited-etag "-"))))))
+
+;; A backup by renaming leaves no file under the old name for a moment (and
+;; with a local `backup-directory-alist' entry it is a copy and a delete):
+;; let `backup-buffer' copy, the save itself is atomic on the host anyway.
+(thither--define file-ownership-preserved-p (_file &optional _group) nil)
+
 (thither--define rename-file (file newname &optional ok)
   (let ((newname (if (directory-name-p newname)
                      (expand-file-name (file-name-nondirectory file) newname)
@@ -588,9 +654,11 @@ The server answers with access(2), so ACLs, read-only mounts and root are right.
     (if (thither--same-host file newname)
         (let ((a (thither--path file)) (b (thither--path newname)))
           (thither--call (car a) "rename" `(("from" . ,(cdr a)) ("to" . ,(cdr b)) ("overwrite" . t))
-                     file "Renaming"))
+                     file "Renaming")
+          (thither--moved-away file))
       (copy-file file newname t t)
-      (if (file-directory-p file) (delete-directory file t) (delete-file file)))
+      (if (file-directory-p file) (delete-directory file t) (delete-file file))
+      (thither--moved-away file))
     nil))
 
 (defun thither--read-local (file)

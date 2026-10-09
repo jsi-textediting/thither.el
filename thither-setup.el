@@ -71,6 +71,8 @@ Plain words (a leading ~ included, so it still expands) are left alone.  Not
                               (thither--host-option host :server-args)
                               (list "--stdio")))))))
 
+(defvar tramp-ignored-file-name-regexp)
+
 ;;;###autoload
 (progn
   ;; Registered when the autoloads are loaded (package.el), or by the :init
@@ -78,7 +80,16 @@ Plain words (a leading ~ included, so it still expands) are left alone.  Not
   ;; /thither:HOST:/ name loads this file on first use.
   (autoload 'thither-file-name-handler "thither-setup")
   (add-to-list 'file-name-handler-alist
-               (cons "\\`/thither:[^:/]+:" #'thither-file-name-handler)))
+               (cons "\\`/thither:[^:/]+:" #'thither-file-name-handler))
+  ;; TRAMP, if loaded before this file, puts its handler in front and would
+  ;; reject the "thither" method; ignored names reach the handler above.
+  ;; (Loading this file then moves the handler to the front, see
+  ;; `thither-fs-enable'.)
+  (let ((old (bound-and-true-p tramp-ignored-file-name-regexp)))
+    (unless (and old (string-match-p (regexp-quote "\\`/thither:[^:/]+:") old))
+      (setq tramp-ignored-file-name-regexp
+            (if old (concat "\\(?:" old "\\)\\|\\(?:\\`/thither:[^:/]+:\\)")
+              "\\`/thither:[^:/]+:")))))
 
 ;;;###autoload
 (defun thither-find-file (host)

@@ -254,21 +254,29 @@
     (puthash "msg" why h)
     h))
 
+(defun thither--run-callback (fn &rest args)
+  "Call FN with ARGS.  An error is reported, like one in a process filter:
+it must neither stop the dispatch of the other frames nor end the connection."
+  (condition-case err (apply fn args)
+    ((debug error)
+     (message "thither: error in callback: %s" (error-message-string err))
+     nil)))
+
 (defun thither--dispatch (conn f)
   (let ((id (gethash "id" f)) (ev (gethash "ev" f)))
     (cond (id
            (let ((cb (gethash id (thither-conn-pending conn))))
              (when cb
                (remhash id (thither-conn-pending conn))
-               (funcall cb (gethash "ok" f) (gethash "err" f)))))
+               (thither--run-callback cb (gethash "ok" f) (gethash "err" f)))))
           ((equal ev "hello") (setf (thither-conn-hello conn) f))
           ((and (null ev) (gethash "err" f))
            (setf (thither-conn-last-error conn) (gethash "err" f)))
           ((gethash "stream" f)
            (let ((h (gethash (gethash "stream" f) (thither-conn-streams conn))))
-             (when h (funcall h f))))
+             (when h (thither--run-callback h f))))
           ((thither-conn-event-fn conn)
-           (funcall (thither-conn-event-fn conn) conn f)))))
+           (thither--run-callback (thither-conn-event-fn conn) conn f)))))
 
 (defun thither--drain (conn)
   (catch 'wait
@@ -291,6 +299,8 @@
               (thither--dispatch conn frame))))))))
 
 (defun thither--drain-safe (conn)
+  ;; Callbacks run under `thither--run-callback': what arrives here is a framing
+  ;; or decoding error, after which the byte stream cannot be trusted.
   (cl-incf (thither-conn-depth conn))
   (unwind-protect
       (condition-case err (thither--drain conn)
@@ -314,14 +324,14 @@
     (clrhash pending)
     (maphash (lambda (id h) (push (cons id h) hs)) streams)
     (clrhash streams)
-    (dolist (cb cbs) (funcall cb nil (thither--disconnected-error why)))
+    (dolist (cb cbs) (thither--run-callback cb nil (thither--disconnected-error why)))
     ;; Running programs are gone with the connection: end their streams.
     (dolist (h hs)
       (let ((f (make-hash-table :test 'equal)))
         (puthash "ev" "exit" f)
         (puthash "stream" (car h) f)
         (puthash "err" (thither--disconnected-error why) f)
-        (funcall (cdr h) f)))))
+        (thither--run-callback (cdr h) f)))))
 
 (defun thither--wait (conn pred timeout)
   "Run process output until PRED returns non-nil.  Return PRED's value."
@@ -486,9 +496,17 @@ of the initial stat, so a concurrent change gives a \"stale\" error."
                                     (aset parts idx (gethash "data" ok)))
                                   (pump)))))))
       (pump)
-      (thither--wait conn (lambda () (or failure (>= done n))) (max thither-timeout 120)))
+      ;; `thither-timeout' without any answer is a timeout, not a slow transfer:
+      ;; the deadline restarts whenever a chunk arrives
+      (let ((seen -1))
+        (while (and (not failure) (< done n) (> done seen))
+          (setq seen done)
+          (thither--wait conn (lambda () (or failure (>= done n) (> done seen))) thither-timeout))))
     (when failure (thither--signal failure))
-    (unless (>= done n) (signal 'thither-error (list "timeout" "read timed out" nil)))
+    (unless (>= done n)
+      ;; late answers must not request further chunks
+      (setq failure t)
+      (signal 'thither-error (list "timeout" "read timed out" nil)))
     (cons (apply #'concat (append parts nil)) etag)))
 
 (defun thither-write-file (conn path data &optional if-match)
@@ -520,6 +538,19 @@ IF-MATCH is an etag (or \"-\" for \"must not exist\"); on mismatch an
                (setq pos end))
              (< pos n)))))
 
+(defun thither--abandon-stream (conn stream)
+  "Kill the program of STREAM, whose output nobody reads any more.
+Its remaining output is acknowledged and dropped, so that the server can
+deliver the exit event and forget the stream."
+  (puthash stream
+           (lambda (f)
+             (let ((ev (gethash "ev" f)) (d (gethash "data" f)))
+               (cond ((member ev '("stdout" "stderr"))
+                      (thither-notify conn "ack" `(("stream" . ,stream) ("n" . ,(length d)))))
+                     ((equal ev "exit") (remhash stream (thither-conn-streams conn))))))
+           (thither-conn-streams conn))
+  (thither-notify conn "kill" `(("stream" . ,stream) ("signal" . "kill"))))
+
 (cl-defun thither-exec (conn argv &key cwd env stdin merge-stderr (timeout thither-timeout))
   "Run ARGV on the server.  Return a plist (:code :killed :stdout :stderr).
 ENV is an alist of strings, STDIN a unibyte string or nil.  With
@@ -535,23 +566,33 @@ MERGE-STDERR the child's stderr arrives in :stdout."
                         ((equal ev "exit")
                          (setq code (gethash "code" f) killed (eq (gethash "killed" f) t)
                                failure (gethash "err" f) done t))))))
-      (thither-call conn "exec"
-                `(("argv" . ,(vconcat argv)) ("cwd" . ,cwd) ("env" . ,env)
-                  ("stdin" . ,(if stdin t :false)) ("merge_stderr" . ,(and merge-stderr t)))
-                (lambda (ok e)
-                  (if e (setq failure e)
-                    (setq stream (gethash "stream" ok))
-                    (puthash stream #'handler (thither-conn-streams conn)))))
-      (thither--wait conn (lambda () (or stream failure)) timeout)
+      (let ((id (thither-call
+                 conn "exec"
+                 `(("argv" . ,(vconcat argv)) ("cwd" . ,cwd) ("env" . ,env)
+                   ("stdin" . ,(if stdin t :false)) ("merge_stderr" . ,(and merge-stderr t)))
+                 (lambda (ok e)
+                   (if e (setq failure e)
+                     (setq stream (gethash "stream" ok))
+                     (puthash stream #'handler (thither-conn-streams conn)))))))
+        (unwind-protect
+            (thither--wait conn (lambda () (or stream failure)) timeout)
+          ;; Timeout or quit: nobody waits for the program any more.  Cancelling
+          ;; the request terminates it; should the answer still come, stop it.
+          (when (and id (not (or stream failure)) (gethash id (thither-conn-pending conn)))
+            (puthash id (lambda (ok _e)
+                          (when ok (thither--abandon-stream conn (gethash "stream" ok))))
+                     (thither-conn-pending conn))
+            (thither-cancel conn id))))
       (when failure (thither--signal failure))
       (unless stream (signal 'thither-error (list "timeout" "exec timed out" nil)))
       (when stdin
         (thither--send-stdin conn stream stdin t))
       (unwind-protect
           (unless (thither--wait conn (lambda () done) timeout)
-            (thither-notify conn "kill" `(("stream" . ,stream) ("signal" . "kill")))
             (signal 'thither-error (list "timeout" "exec timed out" nil)))
-        (remhash stream (thither-conn-streams conn)))
+        (if done
+            (remhash stream (thither-conn-streams conn))
+          (thither--abandon-stream conn stream)))
       (when failure (thither--signal failure)))
     (list :code code :killed killed
           :stdout (apply #'concat (nreverse out))
@@ -583,7 +624,9 @@ could not be started.  STDIN non-nil keeps the child's stdin open for
                       (let ((ev (gethash "ev" f)) (d (gethash "data" f)))
                         (cond ((member ev '("stdout" "stderr"))
                                (let ((cb (if (equal ev "stdout") on-stdout on-stderr)))
-                                 (when cb (funcall cb d)))
+                                 ;; an error in it must not cost the ack (the
+                                 ;; program would block on its full pipe)
+                                 (when cb (thither--run-callback cb d)))
                                (thither-notify conn "ack" `(("stream" . ,stream) ("n" . ,(length d)))))
                               ((equal ev "exit")
                                (remhash stream (thither-conn-streams conn))
