@@ -11,6 +11,7 @@ saves.
 * [Install](#install) (use-package, package.el, plain load-path)
 * [Configuration examples](#configuration-examples)
 * [Using it](#using-it)
+* [Large files (multi-GB sliding viewport)](#large-files-multi-gb-sliding-viewport)
 * [Setting up a host](#setting-up-a-host)
 * [Variables](#variables)
 * [Troubleshooting](#troubleshooting)
@@ -280,6 +281,34 @@ file changed in the meantime the save fails with "File changed on the host"
 instead of overwriting it, and `revert-buffer` reloads. `M-x thither-disconnect-all`
 closes every connection; running remote processes end with it.
 
+## Large files (multi-GB sliding viewport)
+
+Opening multi-gigabyte remote files (logs, CSVs, dumps) over SSH normally freezes Emacs and exhausts system memory. `thither` includes a dedicated sliding viewport subsystem (`thither-large-file-mode`) powered by the server's large-file operations (`lineindex`, `read_range`, `apply_edit`, `search`):
+
+* **O(1) Bounded Memory**: Only the active window (default 5,000 lines, configured via `thither-large-window-lines`) is loaded into Emacs.
+* **Instant Open**: Millisecond indexing via remote `lineindex` without transferring full file contents over SSH.
+* **Automatic Threshold**: When opening a file with `C-x C-f` whose size exceeds `thither-large-file-threshold` (default 10 MB), Emacs automatically prompts to open in large file mode.
+* **O(log K) Line Jumping**: Jump to any line $1 \le L \le \text{total}$ instantly via remote newline prefix-sum binary search.
+* **Server-Side Search**: Run PCRE2 regex or literal searches directly on the host at disk speed via `thither-search`. Matches appear in an interactive `*thither-search*` buffer.
+* **Differential Saving**: Edit lines directly within the viewport. On `C-x C-s` (`save-buffer`), `thither-large-save-buffer` commits an atomic `apply_edit` script: kept byte ranges + modified window text. Only edited text crosses the network, and conflicts are safely detected if the remote file changed.
+
+### Large file commands & keybindings
+
+| Key / Command | Action |
+|---|---|
+| `M-x thither-find-large-file` | Open any remote file directly in `thither-large-file-mode` |
+| `C-c C-g` or `g` | `thither-large-goto-line`: jump to line $1 \dots \text{total}$ |
+| `C-c C-%` or `%` | `thither-large-goto-percent`: jump to percentage (0-100%) |
+| `C-c C-n` / `PageDown` or `n` | `thither-large-page-next`: scroll forward by 75% of viewport |
+| `C-c C-p` / `PageUp` or `p` | `thither-large-page-prev`: scroll backward by 75% of viewport |
+| `C-c <` or `<` | `thither-large-head`: jump to lines 1..window-size |
+| `C-c >` or `>` | `thither-large-tail`: jump to the end of file |
+| `C-c C-s` or `s` | `thither-large-search`: execute server-side search |
+| `M-n` / `M-p` | `thither-large-search-next` / `prev`: cycle between search matches |
+| `C-x C-s` | `save-buffer`: atomically save viewport changes via `apply_edit` |
+
+*Note: Single-character keys (`n`, `p`, `g`, `%`, `s`, `<`, `>`) are active when the buffer is read-only (viewing logs). In edit mode (`C-x C-q`), they insert text normally while `C-c` prefixed bindings remain active.*
+
 ## Setting up a host
 
 The server is POSIX only (Linux, macOS, BSD). Its source currently lives in
@@ -324,6 +353,10 @@ about twenty arguments, e.g. `grep` with many `--exclude`).
 | `thither-cache-ttl` | 3 | seconds that stat/readdir/realpath results are reused; writes flush them |
 | `thither-timeout` | 30 | seconds a synchronous request may take |
 | `thither-disable-remote-tools` | t | no lsp-mode / flycheck in remote buffers |
+| `thither-large-file-threshold` | 10485760 (10 MB) | byte threshold activating `thither-large-file-mode` |
+| `thither-large-window-lines` | 5000 | lines loaded into sliding viewport |
+| `thither-large-confirm` | t | confirm before opening in large-file mode |
+| `thither-large-chunk-size` | 65536 | chunk size for remote line index |
 
 ## Troubleshooting
 
@@ -354,11 +387,11 @@ Works: `find-file` and `save-buffer` with conflict detection, dired,
 filename completion, `project.el` with git, `vc-git` commands, consult live
 search, `shell-command`, `compile`, stdin to async processes
 (`process-send-string`, `process-send-eof`), kill and interrupt of remote
-programs, copying between local and remote.
+programs, copying between local and remote, **multi-GB remote large file
+sliding-viewport editing and server-side search** (`thither-large-file-mode`).
 
 Not yet: ptys (`M-x shell`, `term`, programs needing a tty), LSP servers on the
-host, auto-revert from the server's watch events, the large-file operations of
-the server (`lineindex`, `read_range`, `apply_edit`, `search`), reconnect of
+host, auto-revert from the server's watch events, reconnect of
 running processes, `file-notify`, Windows-native Emacs (only tried from WSL;
 `plink` is used when `system-type` is `windows-nt`).
 

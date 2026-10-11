@@ -488,28 +488,46 @@ with a conflict."
 
 (thither--define insert-file-contents (filename &optional visit beg end replace)
   (barf-if-buffer-read-only)
-  (let* ((res (condition-case err (thither--read-bytes filename)
-                (file-missing
-                 ;; Like the C function: a visited missing file still names the buffer.
-                 (when visit
-                   (setq buffer-file-name (thither--expand-name filename))
-                   (thither--set-etag buffer-file-name nil)
-                   (set-buffer-modified-p nil))
-                 (signal (car err) (cdr err)))))
-         (tmp (thither--temp-file filename))
-         ret)
-    (unwind-protect
+  (let* ((p (thither--path filename))
+         (st (ignore-errors (thither--stat (car p) (cdr p) nil t)))
+         (size (and st (member (gethash "type" st) '("file" "reg")) (gethash "size" st)))
+         (large-thresh (bound-and-true-p thither-large-file-threshold)))
+    (if (and visit (null beg) (null end) size
+             (numberp large-thresh)
+             (>= size large-thresh)
+             (or (not (bound-and-true-p thither-large-confirm))
+                 (y-or-n-p (format "File %s is %s; open in thither large file mode? "
+                                   (file-name-nondirectory filename)
+                                   (file-size-human-readable size)))))
         (progn
-          (let ((coding-system-for-write 'no-conversion))
-            (write-region (car res) nil tmp nil 'silent))
-          (setq ret (thither--real 'insert-file-contents (list tmp visit beg end replace))))
-      (ignore-errors (delete-file tmp)))
-    (when visit
-      (setq buffer-file-name (thither--expand-name filename))
-      (thither--set-etag buffer-file-name (cdr res))
-      (setq buffer-read-only (not (file-writable-p filename)))
-      (set-buffer-modified-p nil))
-    (list (thither--expand-name filename) (cadr ret))))
+          (require 'thither-large)
+          (when replace (erase-buffer))
+          (setq buffer-file-name (thither--expand-name filename))
+          (thither-large-setup-buffer filename (car p) (cdr p) st)
+          (setq-local thither-large--pending-init t)
+          (list (thither--expand-name filename) (buffer-size)))
+      (let* ((res (condition-case err (thither--read-bytes filename)
+                    (file-missing
+                     ;; Like the C function: a visited missing file still names the buffer.
+                     (when visit
+                       (setq buffer-file-name (thither--expand-name filename))
+                       (thither--set-etag buffer-file-name nil)
+                       (set-buffer-modified-p nil))
+                     (signal (car err) (cdr err)))))
+             (tmp (thither--temp-file filename))
+             ret)
+        (unwind-protect
+            (progn
+              (let ((coding-system-for-write 'no-conversion))
+                (write-region (car res) nil tmp nil 'silent))
+              (setq ret (thither--real 'insert-file-contents (list tmp visit beg end replace))))
+          (ignore-errors (delete-file tmp)))
+        (when visit
+          (setq buffer-file-name (thither--expand-name filename))
+          (thither--set-etag buffer-file-name (cdr res))
+          (setq buffer-read-only (not (file-writable-p filename)))
+          (set-buffer-modified-p nil))
+        (list (thither--expand-name filename) (cadr ret))))))
 
 (thither--define file-local-copy (file)
   (let ((res (thither--read-bytes file)) (tmp (thither--temp-file file)))

@@ -655,5 +655,66 @@ could not be started.  STDIN non-nil keeps the child's stdin open for
         (thither-notify conn "kill" `(("stream" . ,stream) ("signal" . ,signal)))
       (setf (thither-exec-handle-killed h) signal))))
 
+;;;; Large-file operations
+
+(defun thither-lineindex (conn path &optional chunk-size timeout)
+  "Build and cache a line index of regular file PATH.
+Returns a hash table with \"size\", \"mtime\", \"mtime_ns\", \"etag\",
+\"chunks\" (vector of [LEN LF] vectors), and \"ends_with_nl\"."
+  (let ((cs (or chunk-size 65536)))
+    (condition-case err
+        (thither-call-sync conn "lineindex" `(("path" . ,path) ("chunk_size" . ,cs)) timeout)
+      (thither-error
+       (let ((code (cadr err)) (extra (cadddr err)))
+         (if (and (equal code "too_large") extra (gethash "min_chunk_size" extra))
+             (thither-call-sync conn "lineindex"
+                                `(("path" . ,path) ("chunk_size" . ,(gethash "min_chunk_size" extra)))
+                                timeout)
+           (signal (car err) (cdr err))))))))
+
+(defun thither-read-range (conn path off len &optional etag timeout)
+  "Read LEN bytes of PATH starting at OFF (0-based byte offset).
+Returns unibyte string of data.  Signals stale if ETAG changed."
+  (thither-call-sync conn "read_range"
+                     `(("path" . ,path) ("off" . ,off) ("len" . ,len)
+                       ,@(and etag `(("etag" . ,etag))))
+                     timeout))
+
+(cl-defun thither-apply-edit (conn path etag script inserts &key chunk-size dest dest-if-match timeout)
+  "Atomically apply SCRIPT and INSERTS to PATH on the host.
+SCRIPT is a vector of alists with (\"keep\" . t) (\"off\" . N) (\"len\" . M)
+or (\"ins\" . IDX) (1-based index into INSERTS).
+Returns updated index hash table with \"etag\", \"size\", \"chunks\", \"ends_with_nl\"."
+  (thither-call-sync conn "apply_edit"
+                     `(("path" . ,path) ("etag" . ,etag)
+                       ("script" . ,(if (vectorp script) script (vconcat script)))
+                       ("inserts" . ,(if (vectorp inserts) inserts (vconcat inserts)))
+                       ,@(and chunk-size `(("chunk_size" . ,chunk-size)))
+                       ,@(and dest `(("dest" . ,dest)))
+                       ,@(and dest-if-match `(("dest_if_match" . ,dest-if-match))))
+                     timeout))
+
+(cl-defun thither-search (conn path pattern &key regex case limit from-off etag timeout)
+  "Search PATH on the host for PATTERN.
+Returns a vector of match hash tables with \"off\", \"line\", \"col\", \"len\"."
+  (let ((opts `(("regex" . ,(if regex t :false))
+                ("case" . ,(if (eq case nil) :false t))
+                ("limit" . ,(or limit 1000)))))
+    (thither-call-sync conn "search"
+                       `(("path" . ,path) ("pattern" . ,pattern)
+                         ("opts" . ,opts)
+                         ,@(and from-off `(("from_off" . ,from-off)))
+                         ,@(and etag `(("etag" . ,etag))))
+                       timeout)))
+
+(defun thither-hash-ranges (conn path ranges &optional etag timeout)
+  "Compute 64-bit FNV-1a hashes of RANGES in PATH.
+RANGES is a list or vector of [OFF LEN] pairs."
+  (thither-call-sync conn "hash_ranges"
+                     `(("path" . ,path)
+                       ("ranges" . ,(if (vectorp ranges) ranges (vconcat ranges)))
+                       ,@(and etag `(("etag" . ,etag))))
+                     timeout))
+
 (provide 'thither)
 ;;; thither.el ends here

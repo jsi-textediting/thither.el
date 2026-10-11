@@ -21,6 +21,7 @@
 
 (require 'thither-fs)
 (require 'thither-proc)
+(require 'thither-large)
 
 (declare-function consult-grep "consult")
 (declare-function consult-find "consult")
