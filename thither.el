@@ -657,10 +657,16 @@ could not be started.  STDIN non-nil keeps the child's stdin open for
 
 ;;;; Large-file operations
 
+(defun thither-true-p (v)
+  "Non-nil when the msgpack boolean V is true.
+False decodes as `:false', which is not nil: test booleans with this."
+  (and v (not (eq v :false))))
+
 (defun thither-lineindex (conn path &optional chunk-size timeout)
   "Build and cache a line index of regular file PATH.
 Returns a hash table with \"size\", \"mtime\", \"mtime_ns\", \"etag\",
-\"chunks\" (vector of [LEN LF] vectors), and \"ends_with_nl\"."
+\"chunks\" (vector of [LEN LF] vectors), and \"ends_with_nl\" (t or
+`:false', see `thither-true-p')."
   (let ((cs (or chunk-size 65536)))
     (condition-case err
         (thither-call-sync conn "lineindex" `(("path" . ,path) ("chunk_size" . ,cs)) timeout)
@@ -672,33 +678,84 @@ Returns a hash table with \"size\", \"mtime\", \"mtime_ns\", \"etag\",
                                 timeout)
            (signal (car err) (cdr err))))))))
 
+(defconst thither-read-range-max (* 8 1024 1024)
+  "Largest length the server accepts in one `read_range'.")
+
 (defun thither-read-range (conn path off len &optional etag timeout)
   "Read LEN bytes of PATH starting at OFF (0-based byte offset).
-Returns unibyte string of data.  Signals stale if ETAG changed."
-  (thither-call-sync conn "read_range"
-                     `(("path" . ,path) ("off" . ,off) ("len" . ,len)
-                       ,@(and etag `(("etag" . ,etag))))
-                     timeout))
+Returns a unibyte string, shorter at the end of the file.  Lengths over
+`thither-read-range-max' are read in several requests.  Signals stale if
+ETAG changed."
+  (let (parts done)
+    (while (and (> len 0) (not done))
+      (let* ((n (min len thither-read-range-max))
+             (data (or (thither-call-sync conn "read_range"
+                                          `(("path" . ,path) ("off" . ,off) ("len" . ,n)
+                                            ,@(and etag `(("etag" . ,etag))))
+                                          timeout)
+                       "")))
+        (push data parts)
+        (setq off (+ off (length data))
+              len (- len (length data))
+              ;; a short answer means end of file
+              done (< (length data) n))))
+    (if (cdr parts) (apply #'concat (nreverse parts)) (or (car parts) ""))))
+
+(defconst thither--inline-insert-max (* 8 1024 1024)
+  "Longer `apply_edit' inserts are uploaded as blobs: a frame holds 16 MiB.")
+
+(defconst thither--blob-piece (* 4 1024 1024)
+  "Bytes per `blob_put'.")
+
+(defvar thither--blob-counter 0)
+
+(defun thither--put-blob (conn data)
+  "Upload unibyte DATA with `blob_put'; return the blob id."
+  (let ((id (format "thither.el-%d-%d" (emacs-pid) (cl-incf thither--blob-counter)))
+        (pos 0) (n (length data)))
+    (while (< pos n)
+      (let ((end (min n (+ pos thither--blob-piece))))
+        (thither-call-sync conn "blob_put" `(("id" . ,id) ("data" . ,(substring data pos end))))
+        (setq pos end)))
+    id))
 
 (cl-defun thither-apply-edit (conn path etag script inserts &key chunk-size dest dest-if-match timeout)
   "Atomically apply SCRIPT and INSERTS to PATH on the host.
 SCRIPT is a vector of alists with (\"keep\" . t) (\"off\" . N) (\"len\" . M)
-or (\"ins\" . IDX) (1-based index into INSERTS).
+or (\"ins\" . IDX) (1-based index into INSERTS).  INSERTS are unibyte
+strings; those longer than `thither--inline-insert-max' are sent as blobs.
+With DEST the result is written there instead (DEST-IF-MATCH: the etag
+DEST must have, \"-\" for none).
 Returns updated index hash table with \"etag\", \"size\", \"chunks\", \"ends_with_nl\"."
-  (thither-call-sync conn "apply_edit"
-                     `(("path" . ,path) ("etag" . ,etag)
-                       ("script" . ,(if (vectorp script) script (vconcat script)))
-                       ("inserts" . ,(if (vectorp inserts) inserts (vconcat inserts)))
-                       ,@(and chunk-size `(("chunk_size" . ,chunk-size)))
-                       ,@(and dest `(("dest" . ,dest)))
-                       ,@(and dest-if-match `(("dest_if_match" . ,dest-if-match))))
-                     timeout))
+  (let (blobs)
+    (unwind-protect
+        (let ((refs (mapcar (lambda (s)
+                              (if (and (stringp s) (> (string-bytes s) thither--inline-insert-max))
+                                  (let ((id (thither--put-blob
+                                             conn (if (multibyte-string-p s)
+                                                      (encode-coding-string s 'utf-8 t)
+                                                    s))))
+                                    (push id blobs)
+                                    `(("blob" . ,id)))
+                                s))
+                            inserts)))
+          (thither-call-sync conn "apply_edit"
+                             `(("path" . ,path) ("etag" . ,etag)
+                               ("script" . ,(if (vectorp script) script (vconcat script)))
+                               ("inserts" . ,(vconcat refs))
+                               ,@(and chunk-size `(("chunk_size" . ,chunk-size)))
+                               ,@(and dest `(("dest" . ,dest)))
+                               ,@(and dest-if-match `(("dest_if_match" . ,dest-if-match))))
+                             timeout))
+      (dolist (id blobs)
+        (ignore-errors (thither-notify conn "blob_drop" `(("id" . ,id))))))))
 
-(cl-defun thither-search (conn path pattern &key regex case limit from-off etag timeout)
+(cl-defun thither-search (conn path pattern &key regex (case t) limit from-off etag timeout)
   "Search PATH on the host for PATTERN.
+CASE nil folds case; it defaults to t (case-sensitive), as in the protocol.
 Returns a vector of match hash tables with \"off\", \"line\", \"col\", \"len\"."
   (let ((opts `(("regex" . ,(if regex t :false))
-                ("case" . ,(if (eq case nil) :false t))
+                ("case" . ,(if case t :false))
                 ("limit" . ,(or limit 1000)))))
     (thither-call-sync conn "search"
                        `(("path" . ,path) ("pattern" . ,pattern)

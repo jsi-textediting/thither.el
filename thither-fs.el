@@ -294,7 +294,25 @@ ignore the names, and move this handler back to the front."
 (thither--define unhandled-file-name-directory (_filename) (expand-file-name "~/"))
 (thither--define file-name-case-insensitive-p (_f) nil)
 (thither--define file-locked-p (_f) nil)
-(thither--define lock-file (_f) nil)
+(thither--define lock-file (file)
+  ;; No lock files on the host.  But like the C `lock_file' for local files,
+  ;; the first change to a buffer whose file changed on the host asks first
+  ;; ("changed on disk; really edit the buffer?").  Large-file buffers are
+  ;; left out: their window loads are changes too, and `apply_edit' checks
+  ;; the etag when they are saved.
+  (let ((buf (if (and buffer-file-name
+                      (or (equal file buffer-file-truename) (equal file buffer-file-name)))
+                 (current-buffer)
+               (find-buffer-visiting file))))
+    (when buf
+      (with-current-buffer buf
+        (when (and (not (bound-and-true-p thither-large-host))
+                   (not (verify-visited-file-modtime buf))
+                   (file-exists-p file))
+          (if (fboundp 'userlock--ask-user-about-supersession-threat)
+              (userlock--ask-user-about-supersession-threat file)
+            (ask-user-about-supersession-threat file)))))
+    nil))
 (thither--define unlock-file (_f) nil)
 (thither--define vc-registered (_f) nil)
 
@@ -485,6 +503,11 @@ with a conflict."
         (when (and st (equal "dir" (gethash "type" st)))
           (signal 'file-error (list "Read error" "Is a directory" file))))
       (thither-read-file (thither-connection (car p)) (cdr p)))))
+
+;; thither-large requires this file, so it is loaded only when needed
+(declare-function thither-large-setup-buffer "thither-large"
+                  (filename host localpath &optional stat window-lines chunk-size))
+(defvar thither-large--pending-init)
 
 (thither--define insert-file-contents (filename &optional visit beg end replace)
   (barf-if-buffer-read-only)

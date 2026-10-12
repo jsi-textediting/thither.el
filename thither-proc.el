@@ -93,6 +93,59 @@ The local shell becomes /bin/sh and its switch (cmd.exe's /c ...) becomes -c."
     (when process-file-side-effects (thither--flush (car p)))
     (if (plist-get r :killed) "Killed" (plist-get r :code))))
 
+;;;; shell-command
+
+;; `shell-command' (M-!, M-&, `shell-command-to-string') runs its command with
+;; `call-process-shell-command', `call-process-region' (through
+;; `shell-command-on-region') and `start-process-shell-command'.  None of them
+;; consults file name handlers: with a remote `default-directory' they would
+;; run the command locally, in the directory `unhandled-file-name-directory'
+;; gives (the local home).  While our `shell-command' handler runs, they are
+;; sent to `process-file' / `start-file-process' instead.  Only then: other
+;; callers of `call-process-region' in a remote buffer (formatters, ...) mean
+;; a local program.
+
+(defvar thither--shell-command nil
+  "Non-nil while `shell-command' runs for a thither `default-directory'.")
+
+(defun thither--shell-remote-p ()
+  (and thither--shell-command (thither--split default-directory) t))
+
+(thither--define shell-command (command &optional output-buffer error-buffer)
+  (let ((thither--shell-command t))
+    (thither--real 'shell-command (list command output-buffer error-buffer))))
+
+(defun thither--advice-call-process-shell-command (orig command &optional infile buffer display &rest args)
+  (if (thither--shell-remote-p)
+      (apply #'process-file-shell-command command infile buffer display args)
+    (apply orig command infile buffer display args)))
+
+(defun thither--advice-start-process-shell-command (orig name buffer command)
+  (if (thither--shell-remote-p)
+      (start-file-process-shell-command name buffer command)
+    (funcall orig name buffer command)))
+
+(defun thither--advice-call-process-region (orig start end program &optional delete buffer display &rest args)
+  "`call-process-region' by `process-file' with the region in a temp file."
+  (if (not (thither--shell-remote-p))
+      (apply orig start end program delete buffer display args)
+    (let* ((input (cond ((stringp start) start)
+                        ((null start) (save-restriction (widen) (buffer-string)))
+                        (t (buffer-substring start end))))
+           (cs (find-operation-coding-system 'call-process-region start end program))
+           (coding-system-for-write (or coding-system-for-write
+                                        (if (consp cs) (cdr cs) cs)
+                                        (cdr default-process-coding-system)
+                                        'utf-8-unix))
+           (tmp (make-temp-file "thither-region")))
+      (unwind-protect
+          (progn
+            (write-region input nil tmp nil 'silent)
+            (when (and delete (not (stringp start)))
+              (if start (delete-region start end) (save-restriction (widen) (erase-buffer))))
+            (apply #'process-file program tmp buffer display args))
+        (ignore-errors (delete-file tmp))))))
+
 (thither--define exec-path ()
   ;; `executable-find' with REMOTE searches these below the remote prefix:
   ;; the PATH the server (and so every program it runs) has.
@@ -338,7 +391,10 @@ FINAL flushes bytes held back as an incomplete character."
                (process-send-eof . thither--advice-send-eof)
                (process-command . thither--advice-command)
                (set-process-coding-system . thither--advice-coding)
-               (accept-process-output . thither--advice-accept)))
+               (accept-process-output . thither--advice-accept)
+               (call-process-shell-command . thither--advice-call-process-shell-command)
+               (call-process-region . thither--advice-call-process-region)
+               (start-process-shell-command . thither--advice-start-process-shell-command)))
     (advice-add (car a) :around (cdr a))))
 
 (thither-proc-install)

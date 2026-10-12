@@ -187,7 +187,14 @@
               (thither-fs-test--sh (format "printf external > %s"
                                        (shell-quote-argument (file-local-name f))))
               (should-not (verify-visited-file-modtime))
-              (insert "three\n")
+              ;; the first change asks, as for a local file changed on disk
+              ;; load userlock.el now: loading it later would undo the cl-letf
+              (autoload-do-load (symbol-function 'ask-user-about-supersession-threat))
+              (let ((asked nil))
+                (cl-letf (((symbol-function 'ask-user-about-supersession-threat)
+                           (lambda (fn) (push fn asked))))
+                  (insert "three\n"))
+                (should (equal (list f) asked)))
               (let ((err (should-error
                           (write-region nil nil f nil t) :type 'file-error)))
                 (should (string-match-p "changed" (format "%S" err))))
@@ -516,6 +523,28 @@
       (with-temp-buffer
         (shell-command "echo in-buffer" (current-buffer))
         (should (equal "in-buffer\n" (buffer-string))))
+      ;; it runs on the host, in default-directory (Emacs's own code would run
+      ;; it locally, in the local home)
+      (let ((here (file-name-nondirectory (directory-file-name d))))
+        (should (string-suffix-p (concat "/" here "\n") (shell-command-to-string "pwd")))
+        ;; output to another buffer (`shell-command-on-region'), stderr apart
+        (let ((out (get-buffer-create " *thither-sc-out*")) (err " *thither-sc-err*"))
+          (unwind-protect
+              (progn
+                (shell-command "pwd; echo oops >&2" out err)
+                (should (string-suffix-p (concat "/" here "\n") (with-current-buffer out (buffer-string))))
+                (should (equal "oops\n" (with-current-buffer err (buffer-string)))))
+            (kill-buffer out)
+            (when (get-buffer err) (kill-buffer err))))
+        ;; asynchronous M-&
+        (let ((out (get-buffer-create " *thither-sc-async*")))
+          (unwind-protect
+              (progn
+                (shell-command "pwd &" out)
+                (should (thither-fs-test--wait
+                         (lambda () (string-match-p (concat "/" (regexp-quote here) "\n")
+                                                    (with-current-buffer out (buffer-string)))))))
+            (let ((kill-buffer-query-functions nil)) (kill-buffer out)))))
       ;; M-x compile (compilation-start -> start-file-process)
       (let* ((buf (compile "echo compiling; exit 3")) (proc (get-buffer-process buf)))
         (unwind-protect
