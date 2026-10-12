@@ -35,8 +35,11 @@
 (defcustom thither-host-options nil
   "Per host overrides, an alist of (HOST . PLIST).
 PLIST keys: :server (program on that host), :server-args (extra arguments
-such as (\"--root\" \"/home/me\")), :command (a function of HOST returning
-the complete command list, replacing everything else)."
+such as (\"--root\" \"/home/me\")), :session (t or a session name of
+[A-Za-z0-9._-], at most 32 characters: run through a persistent
+`thither-server --session NAME' daemon on the host; t means \"default\"),
+:command (a function of HOST returning the complete command list, replacing
+everything else, :session included)."
   :type '(alist :key-type string :value-type plist))
 
 (defcustom thither-hosts nil
@@ -58,19 +61,33 @@ Plain words (a leading ~ included, so it still expands) are left alone.  Not
       arg
     (concat "'" (replace-regexp-in-string "'" "'\\''" arg t t) "'")))
 
+(defconst thither--session-name-regexp "\\`[A-Za-z0-9._-]\\{1,32\\}\\'")
+
+(defun thither--session-name (host)
+  "Session name of HOST's :session option, or nil when it has none.
+An invalid value is an error."
+  (let ((s (thither--host-option host :session)))
+    (cond ((null s) nil)
+          ((eq s t) "default")
+          ((and (stringp s) (string-match-p thither--session-name-regexp s)) s)
+          (t (user-error "thither: bad :session for %s: %S (1-32 characters of A-Z a-z 0-9 . _ -)"
+                         host s)))))
+
 (defun thither-launch-command (host)
   "Command list that runs the server on HOST over plink or ssh."
   (let ((custom (thither--host-option host :command)))
     (if custom
         (funcall custom host)
-      (append (if (eq system-type 'windows-nt)
-                  (list (or (executable-find "plink") "plink") "-ssh" "-batch" "-T" host)
-                (list "ssh" "-T" host))
-              ;; ssh and plink join these with spaces for the remote shell
-              (mapcar #'thither--posix-quote
-                      (append (list (or (thither--host-option host :server) thither-server-program))
-                              (thither--host-option host :server-args)
-                              (list "--stdio")))))))
+      (let ((session (thither--session-name host)))
+        (append (if (eq system-type 'windows-nt)
+                    (list (or (executable-find "plink") "plink") "-ssh" "-batch" "-T" host)
+                  (list "ssh" "-T" host))
+                ;; ssh and plink join these with spaces for the remote shell
+                (mapcar #'thither--posix-quote
+                        (append (list (or (thither--host-option host :server) thither-server-program))
+                                (thither--host-option host :server-args)
+                                (list "--stdio")
+                                (and session (list "--session" session)))))))))
 
 (defvar tramp-ignored-file-name-regexp)
 
@@ -105,6 +122,60 @@ Plain words (a leading ~ included, so it still expands) are left alone.  Not
   "Close every server connection (they are reopened on demand)."
   (interactive)
   (dolist (h (hash-table-keys thither--connections)) (thither-disconnect h)))
+
+;;;; Sessions
+
+(defun thither--read-host (prompt)
+  "The host of the current buffer's remote file or directory, else ask with PROMPT.
+With a prefix argument always ask."
+  (or (and (not current-prefix-arg)
+           (car (thither--split (or buffer-file-name default-directory))))
+      (completing-read prompt
+                       (delete-dups (append thither-hosts (hash-table-keys thither--connections)))
+                       nil nil nil nil
+                       (car (hash-table-keys thither--connections)))))
+
+(defun thither--session-of (host)
+  "Connection to HOST and its hello `session' table; an error without one."
+  (let* ((c (thither-connection host))
+         (s (thither-get (thither-conn-hello c) "session")))
+    (unless (hash-table-p s)
+      (user-error "thither: %s is not in session mode (set :session in `thither-host-options')"
+                  host))
+    (cons c s)))
+
+;;;###autoload
+(defun thither-session-info (host)
+  "Show the state of HOST's thither-server session (see :session).
+Returns the server's `session_info' table."
+  (interactive (list (thither--read-host "Session info for thither host: ")))
+  (let* ((c (car (thither--session-of host)))
+         (i (thither-call-sync c "session_info"))
+         (plugins (append (thither-get i "plugins") nil))
+         (started (thither-get i "started")))
+    (message "thither session %s on %s: pid %s, started %s, version %s, skew %s, %s connection%s, plugins %s"
+             (thither-get i "name") host (thither-get i "daemon_pid")
+             (if (numberp started) (format-time-string "%F %T" started) "?")
+             (thither-get i "version") (or (thither-get i "version_skew") "none")
+             (thither-get i "connections") (if (eql 1 (thither-get i "connections")) "" "s")
+             (if plugins (mapconcat (lambda (p) (format "%s" p)) plugins ", ") "none"))
+    i))
+
+;;;###autoload
+(defun thither-restart-session (host)
+  "End HOST's thither-server session daemon; the next access starts a new one.
+This ends everything the session runs on the host (its programs and,
+later, terminals); open files are not affected.  Asks first."
+  (interactive (list (thither--read-host "Restart the session of thither host: ")))
+  (let* ((cs (thither--session-of host))
+         (name (thither-get (cdr cs) "name")))
+    (when (yes-or-no-p (format "Restart thither session %s on %s (ends its programs and terminals)? "
+                               name host))
+      (thither-call-sync (car cs) "session_shutdown" '(("timeout_ms" . 2000)))
+      (puthash host t thither--session-restarting)
+      (thither-disconnect host)
+      (message "thither: session %s on %s ended; the next access starts a new one" name host)
+      t)))
 
 ;;;; Tools that cannot work on remote files
 

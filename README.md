@@ -60,7 +60,7 @@ Lazy (loaded the first time an `/thither:` name or one of the commands is used):
 (use-package thither-setup
   :ensure nil
   :load-path "~/src/thither.el"
-  :commands (thither-find-file thither-disconnect-all)
+  :commands (thither-find-file thither-disconnect-all thither-session-info thither-restart-session)
   :init
   ;; A /thither: name must find its handler before the package is loaded
   ;; (session restore, recentf, command line arguments, ...).
@@ -87,14 +87,14 @@ checkout, Emacs 29 or newer:
 
 package.el generates `thither-autoloads.el`, which registers the file name handler
 and the commands at startup without loading the package; then plain
-`(use-package thither-setup :ensure nil :commands (thither-find-file thither-disconnect-all))`
+`(use-package thither-setup :ensure nil :commands (thither-find-file thither-disconnect-all thither-session-info thither-restart-session))`
 (or just nothing) is enough. With Emacs 30 and the repository URL of your
 repository:
 
 ```elisp
 (use-package thither
   :vc (:url "<url of the thither.el repository>")
-  :commands (thither-find-file thither-disconnect-all))
+  :commands (thither-find-file thither-disconnect-all thither-session-info thither-restart-session))
 ```
 
 ### Plain load-path
@@ -110,8 +110,8 @@ repository:
 
 `thither-host-options` is an alist `(HOST . PLIST)`; keys: `:server` (program on
 that host), `:server-args` (extra arguments, e.g. `--root` to jail file
-operations, `--log FILE`), `:command` (a function of HOST returning the whole
-command list, replacing everything else).
+operations, `--log FILE`), `:session` (see below), `:command` (a function of
+HOST returning the whole command list, replacing everything else).
 
 ```elisp
 (setq thither-server-program "thither-server"        ; default, found through PATH on the host
@@ -121,6 +121,34 @@ command list, replacing everything else).
                         :server-args ("--root" "/home/me"))
         ("remote-box" :server "/home/user/thither/thither-server")))
 ```
+
+### Sessions (a server that survives disconnects)
+
+`:session` makes the host run `thither-server --stdio --session NAME`: the
+connection goes through a relay to a per-user daemon on the host, which keeps
+running when the connection drops and is reused by the next one. `t` means the
+session `"default"`; a string names it (1-32 characters of `A-Za-z0-9._-`).
+Hosts with `:command` pass `--session` themselves.
+
+```elisp
+(setq thither-host-options
+      '(("remote-box" :server "/home/user/thither/thither-server" :session t)))
+```
+
+On every connect thither checks the session in the server's hello and shows a
+warning (not a prompt) when:
+
+* the daemon runs another version than the installed binary (after an
+  upgrade): restart the session to use the new one;
+* the daemon is a different one than last time (`session NAME was restarted
+  (pid A → B)`): open files are fine, programs it ran are gone;
+* `:session` is set but the server is too old to know sessions.
+
+`M-x thither-session-info` shows the session's name, pid, start time,
+version, skew, connections and plugins. `M-x thither-restart-session` asks,
+then ends the daemon (`session_shutdown`) and disconnects; the next access
+starts a new daemon and reports the new pid. Both take the host of the
+current buffer, or ask for one (always with a prefix argument).
 
 ### Windows (PuTTY sessions, plink, Pageant)
 
@@ -181,7 +209,7 @@ With `use-package`:
 (use-package thither-setup
   :ensure nil
   :load-path "~/src/thither.el"
-  :commands (thither-find-file thither-disconnect-all)
+  :commands (thither-find-file thither-disconnect-all thither-session-info thither-restart-session)
   :bind (("C-c r f" . thither-find-file)
          ("C-c r q" . thither-disconnect-all))
   :init
@@ -248,7 +276,7 @@ completion stack):
   :ensure nil
   :if (file-directory-p my-thither-dir)
   :load-path my-thither-dir
-  :commands (thither-find-file thither-disconnect-all)
+  :commands (thither-find-file thither-disconnect-all thither-session-info thither-restart-session)
   :bind (("C-c r f" . thither-find-file))
   :init
   (autoload 'thither-file-name-handler "thither-setup")
@@ -275,6 +303,7 @@ completion stack):
 | Search | `consult-ripgrep` / `consult-fd` with a remote `default-directory`, `project-find-file`, `M-x grep` |
 | Run commands | `M-x compile`, `M-!`, `shell-command`, `process-file`, `start-file-process`, `make-process` with `default-directory` on the host |
 | Reconnect | automatic on next use; `M-x thither-disconnect-all` forces it |
+| Sessions (`:session`) | `M-x thither-session-info`, `M-x thither-restart-session` |
 
 Saving is atomic on the host. The buffer remembers the file's etag; when the
 file changed in the meantime the save fails with "File changed on the host"
@@ -348,7 +377,7 @@ about twenty arguments, e.g. `grep` with many `--exclude`).
 |---|---|---|
 | `thither-hosts` | nil | host names offered by `thither-find-file` (connected hosts are always offered) |
 | `thither-server-program` | `"thither-server"` | server program on the host |
-| `thither-host-options` | nil | per host `:server`, `:server-args`, `:command` |
+| `thither-host-options` | nil | per host `:server`, `:server-args`, `:session`, `:command` |
 | `thither-command-function` | `thither-launch-command` | function of HOST returning the command list; set it to take over completely |
 | `thither-cache-ttl` | 3 | seconds that stat/readdir/realpath results are reused; writes flush them |
 | `thither-timeout` | 30 | seconds a synchronous request may take |

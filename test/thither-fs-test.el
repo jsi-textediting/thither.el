@@ -594,6 +594,28 @@
     (should (equal '("'/opt/my dir/thither'" "--root" "'$HOME'" "--stdio")
                    (last (thither-launch-command "remote-box") 4)))))
 
+(ert-deftest thither-setup-launch-session ()
+  (require 'thither-setup)
+  (let ((thither-host-options
+         `(("a" :session t :server-args ("--root" "/r"))
+           ("b" :session "el_1.x-Y")
+           ("c" :session "bad name")
+           ("d" :session ,(make-string 33 ?x))
+           ("e" :session "s" :command ,(lambda (h) (list "my-ssh" h "srv" "--stdio")))
+           ("f" :session nil))))
+    (should (equal '("thither-server" "--root" "/r" "--stdio" "--session" "default")
+                   (last (thither-launch-command "a") 6)))
+    (should (equal '("thither-server" "--stdio" "--session" "el_1.x-Y")
+                   (last (thither-launch-command "b") 4)))
+    (should-error (thither-launch-command "c") :type 'user-error)
+    (should-error (thither-launch-command "d") :type 'user-error)
+    ;; :command keeps full control
+    (should (equal '("my-ssh" "e" "srv" "--stdio") (thither-launch-command "e")))
+    (should (equal '("thither-server" "--stdio") (last (thither-launch-command "f") 2)))
+    (should (equal "default" (thither--session-name "a")))
+    (should-not (thither--session-name "f"))
+    (should-not (thither--session-name "unknown"))))
+
 (ert-deftest thither-fs-write-excl-existing ()
   (thither-fs-test--with-dir d
     (let ((f (concat d "e")))
@@ -667,6 +689,168 @@
       (should-not (process-live-p p))
       (should (eq 'exit (process-status p)))
       (delete-process p))))
+
+;;;; Sessions
+
+(defun thither-fs-test--hello (&rest session)
+  "A fake hello; SESSION is a plist of its session table (none when empty)."
+  (let ((h (make-hash-table :test 'equal)))
+    (puthash "ev" "hello" h)
+    (puthash "home" "/home/u" h)
+    (puthash "build_id" "b0" h)
+    (when session
+      (let ((s (make-hash-table :test 'equal)))
+        (while session
+          (puthash (substring (symbol-name (pop session)) 1) (pop session) s))
+        (puthash "session" s h)))
+    h))
+
+(defmacro thither-fs-test--fake-session (&rest body)
+  "Run BODY with fresh session state; `connect' warnings land in `warnings'."
+  (declare (indent 0))
+  `(let ((thither--session-pids (make-hash-table :test 'equal))
+         (thither--session-warned (make-hash-table :test 'equal))
+         (thither--session-restarting (make-hash-table :test 'equal))
+         (thither--connections (make-hash-table :test 'equal))
+         (thither-command-function (lambda (_h) '("srv" "--stdio" "--session" "s")))
+         (warnings nil))
+     (ignore warnings)
+     (cl-letf (((symbol-function 'display-warning)
+                (lambda (type msg &rest _) (should (eq type 'thither)) (push msg warnings))))
+       ,@body)))
+
+(defun thither-fs-test--connect-with (hello)
+  "Connect to the fake host \"h\" answering HELLO (the conn is never alive)."
+  (cl-letf (((symbol-function 'thither-connect)
+             (lambda (_cmd &rest _) (thither--make-conn :hello hello))))
+    (thither-connection "h")))
+
+(ert-deftest thither-fs-session-same-pid-no-notice ()
+  (thither-fs-test--fake-session
+    (thither-fs-test--connect-with (thither-fs-test--hello :name "s" :daemon_pid 100))
+    (thither-fs-test--connect-with (thither-fs-test--hello :name "s" :daemon_pid 100))
+    (thither-fs-test--connect-with (thither-fs-test--hello :name "s" :daemon_pid 100))
+    (should (equal nil warnings))
+    (should (equal 100 (gethash "h" thither--session-pids)))))
+
+(ert-deftest thither-fs-session-pid-change-notice ()
+  (thither-fs-test--fake-session
+    (thither-fs-test--connect-with (thither-fs-test--hello :name "s" :daemon_pid 100))
+    (thither-fs-test--connect-with (thither-fs-test--hello :name "s" :daemon_pid 200))
+    (should (= 1 (length warnings)))
+    (should (string-match-p "session s on h was restarted (pid 100 → 200)" (car warnings)))
+    (should-not (string-match-p "as requested" (car warnings)))
+    (should (equal 200 (gethash "h" thither--session-pids)))
+    ;; after thither-restart-session the notice says so, once
+    (setq warnings nil)
+    (puthash "h" t thither--session-restarting)
+    (thither-fs-test--connect-with (thither-fs-test--hello :name "s" :daemon_pid 300))
+    (thither-fs-test--connect-with (thither-fs-test--hello :name "s" :daemon_pid 300))
+    (should (= 1 (length warnings)))
+    (should (string-match-p "restarted as requested (pid 200 → 300)" (car warnings)))
+    (should-not (gethash "h" thither--session-restarting))))
+
+(ert-deftest thither-fs-session-skew-notice ()
+  (thither-fs-test--fake-session
+    (let ((skewed (thither-fs-test--hello :name "s" :daemon_pid 100 :version "2.1.6"
+                                          :version_skew "2.1.7 (b1)")))
+      ;; one notice per daemon, however often it reconnects
+      (thither-fs-test--connect-with skewed)
+      (thither-fs-test--connect-with skewed)
+      (should (= 1 (length warnings)))
+      (should (string-match-p "remote session s on h runs thither-server 2.1.6 (b0), installed is 2.1.7 (b1); restart the session to upgrade"
+                              (car warnings)))
+      ;; a new daemon that is still skewed: a pid notice and a skew notice
+      (setq warnings nil)
+      (thither-fs-test--connect-with (thither-fs-test--hello :name "s" :daemon_pid 101 :version "2.1.6"
+                                                            :version_skew "2.1.7 (b1)"))
+      (should (= 2 (length warnings)))
+      (should (cl-some (lambda (w) (string-match-p "installed is" w)) warnings))
+      (should (cl-some (lambda (w) (string-match-p "pid 100 → 101" w)) warnings)))))
+
+(ert-deftest thither-fs-session-old-server-notice ()
+  (thither-fs-test--fake-session
+    (thither-fs-test--connect-with (thither-fs-test--hello))
+    (thither-fs-test--connect-with (thither-fs-test--hello))
+    (should (= 1 (length warnings)))
+    (should (string-match-p "does not support sessions" (car warnings)))
+    ;; without --session nothing is said
+    (setq warnings nil)
+    (let ((thither-command-function (lambda (_h) '("srv" "--stdio"))))
+      (thither-fs-test--connect-with (thither-fs-test--hello))
+      (thither-fs-test--connect-with (thither-fs-test--hello)))
+    (should-not warnings)))
+
+(ert-deftest thither-fs-session-requested-p ()
+  (should (thither--session-requested-p "x" '("ssh" "h" "srv" "--stdio" "--session" "a")))
+  (should (thither--session-requested-p "x" '("ssh" "h" "srv --stdio --session a")))
+  (should-not (thither--session-requested-p "x" '("ssh" "h" "srv" "--stdio" "--sessions")))
+  (require 'thither-setup)
+  (let ((thither-host-options '(("x" :session t))))
+    (should (thither--session-requested-p "x" '("my-command")))))
+
+(ert-deftest thither-fs-session-closing-event ()
+  (let ((conn (thither--make-conn :hello (thither-fs-test--hello :name "s7" :daemon_pid 1)))
+        (f (make-hash-table :test 'equal)) msg)
+    (puthash "ev" "session_closing" f)
+    (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
+      (thither--dispatch conn f))
+    (should (equal "thither: remote session s7 is shutting down" msg))))
+
+(defun thither-fs-test--session-pid ()
+  (thither-get (thither-get (thither-conn-hello (thither-connection thither-fs-test--host)) "session")
+               "daemon_pid"))
+
+(ert-deftest thither-fs-session-live ()
+  "Reconnect to the same daemon, then restart it (test/run.sh session)."
+  (unless (member "--session" (thither-fs-test--command))
+    (ert-skip "THITHER_SERVER has no --session (use test/run.sh session)"))
+  (require 'thither-setup)
+  (let ((host thither-fs-test--host) (warnings nil) (asked nil))
+    (cl-letf (((symbol-function 'display-warning) (lambda (_type msg &rest _) (push msg warnings)))
+              ((symbol-function 'yes-or-no-p) (lambda (p) (push p asked) t)))
+      (thither-disconnect host)
+      (thither-fs-test--with-dir d
+        (let ((f (concat d "s.txt"))
+              (pid1 (thither-fs-test--session-pid)))
+          (should (integerp pid1))
+          (write-region "one\n" nil f nil 'silent)
+          ;; the transport dies; the daemon stays
+          (let ((c (thither-connection host)))
+            (delete-process (thither-conn-proc c))
+            (should (thither-fs-test--wait (lambda () (thither-conn-dead c)))))
+          (should (equal pid1 (thither-fs-test--session-pid)))
+          (should (equal "one\n" (thither-fs-test--slurp f)))
+          (write-region "two\n" nil f nil 'silent)
+          (should (equal "two\n" (thither-fs-test--slurp f)))
+          (should-not warnings)
+          (let ((info (thither-session-info host)))
+            (should (equal pid1 (thither-get info "daemon_pid")))
+            (should (stringp (thither-get info "name")))
+            (should (integerp (thither-get info "connections"))))
+          ;; restart: asks, ends the daemon; the next use starts a new one
+          (should (thither-restart-session host))
+          (should asked)
+          (should-not (gethash host thither--connections))
+          (let ((pid2 (thither-fs-test--session-pid)))
+            (should (integerp pid2))
+            (should-not (equal pid1 pid2))
+            (should (= 1 (length warnings)))
+            (should (string-match-p (format "restarted as requested (pid %d → %d)" pid1 pid2)
+                                    (car warnings))))
+          (should (equal "two\n" (thither-fs-test--slurp f))))))
+    ;; a host that is not in session mode
+    (let ((thither-command-function
+           (lambda (_h)
+             (let ((cmd (thither-fs-test--command)) out)
+               (while cmd
+                 (if (equal (car cmd) "--session") (setq cmd (cddr cmd)) (push (pop cmd) out)))
+               (nreverse out)))))
+      (unwind-protect
+          (progn
+            (should-error (thither-session-info "plain") :type 'user-error)
+            (should-error (thither-restart-session "plain") :type 'user-error))
+        (thither-disconnect "plain")))))
 
 (provide 'thither-fs-test)
 ;;; thither-fs-test.el ends here

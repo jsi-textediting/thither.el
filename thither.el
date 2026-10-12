@@ -246,7 +246,7 @@
   hello chunks (nbytes 0) need
   event-fn (streams (make-hash-table)) last-error dead sending outq (depth 0))
 
-(defun thither-get (table key) (and table (gethash key table)))
+(defun thither-get (table key) (and (hash-table-p table) (gethash key table)))
 
 (defun thither--disconnected-error (why)
   (let ((h (make-hash-table :test 'equal)))
@@ -270,6 +270,11 @@ it must neither stop the dispatch of the other frames nor end the connection."
                (remhash id (thither-conn-pending conn))
                (thither--run-callback cb (gethash "ok" f) (gethash "err" f)))))
           ((equal ev "hello") (setf (thither-conn-hello conn) f))
+          ;; the daemon of a --session server is ending; the connection closes
+          ;; next and the next use reconnects (starting a new daemon)
+          ((equal ev "session_closing")
+           (message "thither: remote session %s is shutting down"
+                    (or (thither-get (thither-get (thither-conn-hello conn) "session") "name") "?")))
           ((and (null ev) (gethash "err" f))
            (setf (thither-conn-last-error conn) (gethash "err" f)))
           ((gethash "stream" f)

@@ -106,19 +106,83 @@
 (defvar thither--connections (make-hash-table :test 'equal))
 (defvar thither--cache (make-hash-table :test 'equal))
 
+;;;; Sessions (thither-server --session: a daemon that outlives the connection)
+
+(defvar thither--session-pids (make-hash-table :test 'equal)
+  "HOST -> daemon_pid of the last session hello seen from HOST.")
+
+(defvar thither--session-warned (make-hash-table :test 'equal)
+  "Keys (HOST KIND PID) of the session warnings already shown.")
+
+(defvar thither--session-restarting (make-hash-table :test 'equal)
+  "HOSTs whose session `thither-restart-session' has just ended.")
+
+(declare-function thither--session-name "thither-setup")
+
+(defun thither--session-requested-p (host command)
+  "Non-nil when HOST is meant to run in session mode.
+That is the :session host option of thither-setup, or a --session argument
+in COMMAND (a host with :command, or `thither-command-function')."
+  (or (and (fboundp 'thither--session-name) (ignore-errors (thither--session-name host)))
+      (cl-some (lambda (a) (and (stringp a) (string-match-p "\\(?:\\`\\| \\)--session\\(?: \\|\\'\\)" a)))
+               command)))
+
+(defun thither--session-warn (fmt &rest args)
+  (display-warning 'thither (apply #'format fmt args) :warning))
+
+(defun thither--session-check (host conn requested old-hello)
+  "Report what the hello of CONN says about HOST's session.
+REQUESTED: session mode was asked for.  OLD-HELLO: the hello of the previous
+connection to HOST, or nil."
+  (let* ((hello (thither-conn-hello conn))
+         (s (thither-get hello "session")))
+    (if (not (hash-table-p s))
+        (when (and requested (not (gethash (list host 'no-session nil) thither--session-warned)))
+          (puthash (list host 'no-session nil) t thither--session-warned)
+          (thither--session-warn
+           "thither-server on %s does not support sessions (its hello has no session); \
+running without one, upgrade the server" host))
+      (let* ((name (or (gethash "name" s) "default"))
+             (pid (gethash "daemon_pid" s))
+             (skew (gethash "version_skew" s))
+             (old (or (gethash host thither--session-pids)
+                      (thither-get (thither-get old-hello "session") "daemon_pid")))
+             (restarting (gethash host thither--session-restarting)))
+        (remhash host thither--session-restarting)
+        (when (and skew (not (gethash (list host 'skew pid) thither--session-warned)))
+          (puthash (list host 'skew pid) t thither--session-warned)
+          (let ((build (gethash "build_id" hello)))
+            (thither--session-warn
+             "remote session %s on %s runs thither-server %s, installed is %s; \
+restart the session to upgrade (M-x thither-restart-session, this ends its terminals)"
+             name host
+             (if build (format "%s (%s)" (gethash "version" s) build) (gethash "version" s))
+             skew)))
+        (when (and old pid (not (equal old pid)))
+          (thither--session-warn
+           (if restarting
+               "session %s on %s was restarted as requested (pid %s → %s)"
+             "session %s on %s was restarted (pid %s → %s); open files are unaffected, \
+its programs and terminals were lost")
+           name host old pid))
+        (when pid (puthash host pid thither--session-pids))))))
+
 (defun thither-connection (host)
   "The live connection for HOST, connecting if needed."
   (let ((c (gethash host thither--connections)))
     (if (and c (thither-alive-p c))
         c
-      (setq c (condition-case err
-                  (thither-connect (funcall thither-command-function host))
-                (error (signal 'file-error
-                               (list "Cannot connect to thither host" host
-                                     (error-message-string err))))))
-      (puthash host c thither--connections)
-      (thither--flush host)
-      c)))
+      (let* ((old-hello (and c (thither-conn-hello c)))
+             command)
+        (setq c (condition-case err
+                    (thither-connect (setq command (funcall thither-command-function host)))
+                  (error (signal 'file-error
+                                 (list "Cannot connect to thither host" host
+                                       (error-message-string err))))))
+        (puthash host c thither--connections)
+        (thither--flush host)
+        (thither--session-check host c (thither--session-requested-p host command) old-hello)
+        c))))
 
 (defun thither-disconnect (host)
   (let ((c (gethash host thither--connections)))
